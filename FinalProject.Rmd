@@ -1,0 +1,813 @@
+---
+title: "W20 Bio201 final Project"
+author: "Akshaya Ravikumar"
+date: "3/25/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "~/Documents/UMBio201/Projects/")
+```
+
+# Load Packages
+```{r include=FALSE}
+library(vegan)
+library(tidyverse)
+library(readxl)
+library(broom)
+library(cowplot)
+library(phyloseq)
+set.seed(7)
+source("miseqR.R")
+```
+
+# Load Data
+Import the sample measurements and data. Based on the number of samples per participant, are the data in this file from individual samples or weekly averages?  
+```{r}
+# name: sample_df
+
+sample_indiv_df <- read_delim("sample_measurements_indv.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE,
+                            col_types = cols( .default = col_character(),
+                                               Sample_number = col_double(),
+                                               Final_weight = col_double(),
+                                               Acetate_mM = col_double(),
+                                               Acetate_mmol_kg = col_double(),
+                                               Butyrate_mM = col_double(),
+                                               Butyrate_mmol_kg = col_double(),
+                                               Propionate_mM = col_double(),
+                                               Propionate_mmol_kg = col_double(),
+                                               pH = col_logical(),
+                                               Status = col_logical(),
+                                              Bristol_score = col_logical(),
+                                              Bristol_numeric = col_logical())) %>%
+  # make all column names lower case
+  rename_all(tolower) 
+
+#Weekly has weekly averages per participant, use weekly for now
+sample_weekly_df <- read_delim("sample_measurements_wkly.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE) %>%
+  # make all column names lower case
+  rename_all(tolower) %>%
+  mutate(id = paste(participant_id, study_week, sep = "_")) 
+```
+
+##Import the shared table.
+```{r}
+#name: shared_m
+shared_m <- read_delim("~/Documents/UMBio201/Projects/shared_table_wkly.txt",
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, na=c("NA"),
+                            col_types = list()) %>%
+             # remove duplicate sample ids
+              distinct(., ID, .keep_all = TRUE)%>%
+    select(ID, starts_with("Otu")) %>%
+  # drop control samples from sequencing
+  filter(str_detect(ID, "^U")) %>%
+  # remove duplicate sample ids
+  distinct(ID, .keep_all = TRUE) %>% 
+  # sample IDs need to be made into row names
+  column_to_rownames(var = "ID") %>% 
+  # convert data frame to matrix object
+  as.matrix() %>% 
+  # convert to phyloseq object 
+  otu_table(., taxa_are_rows = FALSE) 
+
+
+             
+
+
+```
+
+
+Import the taxonomy table.
+```{r}
+#name: taxa_m
+
+taxa_m <- read_delim("taxonomy_table.txt",
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE, na=c("NA"),
+                            col_types = list()) %>%
+               # sequence variants (OTUs) need to be made into row names 
+  column_to_rownames(var = "OTUs") %>% 
+  as.matrix() %>%
+  # convert to phyloseq object 
+  tax_table() 
+ 
+
+
+```
+
+##Create a phyloseq object 
+```{r}
+# name the result: physq_enterotype_number (e.g., physq_4)
+
+sample_weekly_m <- sample_weekly_df %>%
+  # make all column names lower case
+  rename_all(tolower) %>% 
+  # remove duplicate sample ids --\
+  distinct(., participant_id, .keep_all = TRUE) %>%  
+  # sample IDs need to be made into row names
+  column_to_rownames(var = "id") %>% 
+  # specify type of phyloseq object
+  sample_data() 
+  
+
+
+
+physq_final1 <- phyloseq(shared_m, taxa_m, sample_weekly_m) %>% 
+  # subset for consent and compliance
+  subset_samples(., quantity_compliant != "none") %>%
+  # subset for weeks of interest
+  subset_samples(., study_week == "week1" | study_week == "week3") %>%
+  # subset for potato supplements 
+  subset_samples(., supplement_consumed == "BRMPS" | supplement_consumed == "LOODAT") 
+```
+
+##Calculate Butyrate Delta and find Positives 
+```{r}
+
+butyrate_delta <- sample_weekly_df %>%
+  # keep only columns of interest
+  select(participant_id, semester, supplement_consumed, 
+         frequency, study_week, butyrate_mean)%>% 
+  # keep only weeks of interest
+  filter(study_week == "week1" | study_week == "week3",
+         supplement_consumed == "LOODAT" | supplement_consumed == "BRMPS") %>% 
+  # widen data frame
+  spread(study_week, butyrate_mean)  %>%
+  # drop NAs from select columns
+  drop_na(week1, week3) %>% 
+  # calculate difference
+  mutate(delta_but = week3 - week1) %>%  
+  # drop extra columns
+  select(-week3, -week1) %>%
+  add_column(butyrate_status = "-")
+
+butyrate_delta$butyrate_status[butyrate_delta$delta_but > 0] <- "positive"
+butyrate_delta$butyrate_status[butyrate_delta$delta_but < 0] <- "negative"
+butyrate_delta$butyrate_status[butyrate_delta$delta_but == 0] <- "no change"
+```
+
+```{r}
+#Summary Statistics ffor Butyrate Delta
+
+summary(butyrate_delta$delta_but)
+```
+
+```{r}
+#Create a df with only negative or no change 
+
+butyrate_nres <- butyrate_delta %>%
+  filter(butyrate_status != "positive")
+
+butyrate_negdf <- merge(butyrate_nres, sample_weekly_df, by = "participant_id", all.x=TRUE) %>%
+  filter(study_week == "week1" | study_week == "week3")
+
+butyrate_df <- merge(butyrate_delta, sample_weekly_df, by = "participant_id", all.x=TRUE) %>%
+    filter(study_week == "week1" | study_week == "week3") %>%
+    select(-ph_median, -ph_mean, -bristol_median, -bristol_mean, -blood_glucose_median, -blood_glucose_mean,
+           -acetate_median, -acetate_mean, -propionate_median, -propionate_mean, -butyrate_median, -id) %>%
+    spread(study_week, butyrate_mean)  %>%
+  # drop NAs from select columns
+  drop_na(week1, week3) %>% 
+  gather(study_week, butyrate_mean, week1, week3) %>%
+  mutate(id = paste(participant_id, study_week, sep = "_"))
+
+
+
+```
+
+There are 102 instances where after potato starch consumption, the butyrate concentration decreases.
+
+Therefore, the next step is to identify commonality among these individuals.
+
+## Butyrate Decrease Test
+
+Is there a significant decrease amongst the negative response individuals?
+```{r}
+
+but_wk1_df <- butyrate_negdf %>%
+  filter(study_week == "week1") %>%
+  rename(but_wk1 = "butyrate_mean" ) %>%
+  select(-study_week)
+
+but_wk3_df <- butyrate_negdf %>%
+  filter(study_week == "week3") %>%
+  rename(but_wk3 = "butyrate_mean") %>%
+  select(-study_week)
+
+but_plot <- butyrate_negdf %>%
+  ggplot(aes(x = study_week, y = butyrate_mean )) +
+  geom_violin(aes(color = study_week)) + geom_jitter(aes(color = study_week)) +
+  facet_grid(~frequency.x) +
+  xlab("Study Week") +
+  ylab("Butryate Mean")+
+  theme(legend.position = "none")
+but_plot
+
+
+summarise(but_wk1_df, sample_size = n())
+
+shapiro.test(but_wk1_df$but_wk1) #p-value = 0.3916
+
+ggplot(but_wk1_df, aes(x = but_wk1)) + geom_histogram()
+
+qqnorm(but_wk1_df$but_wk1); qqline(but_wk1_df$but_wk1) 
+
+shapiro.test(but_wk3_df$but_wk3) #p-value = 0.1148
+
+ggplot(but_wk3_df, aes(x = but_wk3)) + geom_histogram()
+
+qqnorm(but_wk3_df$but_wk3); qqline(but_wk3_df$but_wk3) 
+
+
+
+var.test(x = but_wk1_df$but_wk1, 
+         y = but_wk3_df$but_wk3, 
+         alternative = "two.sided") 
+#p-value = 0.004636, variances not equal
+    
+    
+    ##But
+t.test(x = but_wk1_df$but_wk1, 
+       y = but_wk3_df$but_wk3,
+       paired = TRUE, 
+       var.equal = FALSE, 
+       alternative = "greater")
+#p-value: <2.2e-16, very significant decrease
+
+#set alternative to greater, since the first week should have a greater mean butyrate than the second
+
+
+
+
+```
+
+## Butyrate Delta Phyloseq
+
+```{r}
+
+
+butyrate_m <- butyrate_df %>%
+  # make all column names lower case
+  rename_all(tolower) %>% 
+  # remove duplicate sample ids 
+  # sample IDs need to be made into row names
+  column_to_rownames(var = "id") %>% 
+  # specify type of phyloseq object
+  sample_data() 
+
+physq_but <- phyloseq(shared_m, taxa_m, butyrate_m) %>% 
+  # subset for consent and compliance
+  subset_samples(., quantity_compliant != "none") %>%
+  # subset for weeks of interest
+  subset_samples(., study_week == "week1" | study_week == "week3") %>%
+  # subset for potato supplements 
+  subset_samples(., supplement_consumed.y == "BRMPS" | supplement_consumed.y == "LOODAT") 
+
+
+```
+
+
+### Relative Abundance
+The code below filters for participants who had negative status, then plots the relative abundance of each phyla found in each participant. 
+```{r}
+physq_phyla <- physq_but %>% 
+  # tax glom groups together taxa with the same name
+  tax_glom("Phylum") %>%
+  # convert counts to relative abundance 
+  transform_sample_counts(function(x) {x/sum(x)} ) %>%
+  # convert phyloseq object (matrix) to data frame 
+  psmelt() %>%
+  # sort alphabetically 
+  arrange(Phylum) %>%
+  # Calculate weekly mean of relative abundance
+  group_by(participant_id, study_week, semester.y, 
+           frequency.y, butyrate_status, Phylum, OTU) %>%
+  summarise(relative_abundance = mean(Abundance, na.rm = TRUE)) %>%
+  # remove low abundance taxa
+  filter(relative_abundance > 0.001)
+physq_phyla
+```
+#Plot for Negative Status Week 1
+```{r}
+negbut_plotwk1 <- physq_phyla %>%
+  # filter for supplement and study week 
+  filter(butyrate_status == "negative",
+         study_week == "week1") %>% 
+  # set parameters for plot
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  # layer for stacked bar plot 
+  geom_bar(stat = "identity") +
+  # clean up x-axis 
+  theme(axis.title.x = element_blank(), #remove x-axis label 
+        axis.text.x =  element_text(angle = 90, #rotate tick labels 
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  # clean up y-axis
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 1 - Negative Butyrate Status") +
+  scale_fill_manual(name = "Phylum",
+                  #these are all the phylum categories
+                  breaks = c("Actinobacteria", "Bacteria_unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #these are updated names for the phyla
+                  labels = c("Actinobacteria", "Unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #colors for each category
+                  values = c("#4bb092", "#618bcb",
+                             "#b95d6a", "#79853d",
+                             "#c783c1", "#bd7a43",
+                             "#c9aa3c", "#d4447a",
+                             "#7663cb", "#67b34a",
+                             "#d35238")  )
+negbut_plotwk1
+```
+
+#Plot for Negative Status Week 3
+```{r}
+negbut_plotwk3 <- physq_phyla %>%
+  # filter for supplement and study week 
+  filter(butyrate_status == "negative",
+         study_week == "week3") %>% 
+  # set parameters for plot
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  # layer for stacked bar plot 
+  geom_bar(stat = "identity") +
+  # clean up x-axis 
+  theme(axis.title.x = element_blank(), #remove x-axis label 
+        axis.text.x =  element_text(angle = 90, #rotate tick labels 
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  # clean up y-axis
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 3 - Negative Butyrate Status")+
+  scale_fill_manual(name = "Phylum",
+                  #these are all the phylum categories
+                  breaks = c("Actinobacteria", "Bacteria_unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #these are updated names for the phyla
+                  labels = c("Actinobacteria", "Unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #colors for each category
+                  values = c("#4bb092", "#618bcb",
+                             "#b95d6a", "#79853d",
+                             "#c783c1", "#bd7a43",
+                             "#c9aa3c", "#d4447a",
+                             "#7663cb", "#67b34a",
+                             "#d35238")  )
+negbut_plotwk3
+```
+
+#Plot for Positive Status Week 1
+```{r}
+posbut_plotwk1 <- physq_phyla %>%
+  # filter for supplement and study week 
+  filter(butyrate_status == "positive",
+         study_week == "week1") %>% 
+  # set parameters for plot
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  # layer for stacked bar plot 
+  geom_bar(stat = "identity") +
+  # clean up x-axis 
+  theme(axis.title.x = element_blank(), #remove x-axis label 
+        axis.text.x =  element_text(angle = 90, #rotate tick labels 
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  # clean up y-axis
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 1 - Positive Butyrate Status")+
+  scale_fill_manual(name = "Phylum",
+                  #these are all the phylum categories
+                  breaks = c("Actinobacteria", "Bacteria_unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #these are updated names for the phyla
+                  labels = c("Actinobacteria", "Unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #colors for each category
+                  values = c("#4bb092", "#618bcb",
+                             "#b95d6a", "#79853d",
+                             "#c783c1", "#bd7a43",
+                             "#c9aa3c", "#d4447a",
+                             "#7663cb", "#67b34a",
+                             "#d35238")  )
+posbut_plotwk1
+```
+
+#Plot for Positive Status Week 3
+```{r}
+posbut_plotwk3 <- physq_phyla %>%
+  # filter for supplement and study week 
+  filter(butyrate_status == "positive",
+         study_week == "week3") %>% 
+  # set parameters for plot
+  ggplot(aes(x = participant_id, y = relative_abundance,
+             fill = Phylum,
+             study_week, frequency)) + 
+  # layer for stacked bar plot 
+  geom_bar(stat = "identity") +
+  # clean up x-axis 
+  theme(axis.title.x = element_blank(), #remove x-axis label 
+        axis.text.x =  element_text(angle = 90, #rotate tick labels 
+                                    vjust = 0.5,
+                                    hjust = 0.5,
+                                    size = 8)) +
+  # clean up y-axis
+  ylab("Relative Abundance\n(% total sequences)") +
+  ggtitle("Week 3 - Positive Butyrate Status")+
+  scale_fill_manual(name = "Phylum",
+                  #these are all the phylum categories
+                  breaks = c("Actinobacteria", "Bacteria_unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #these are updated names for the phyla
+                  labels = c("Actinobacteria", "Unclassified", 
+                             "Bacteroidetes", "Elusimicrobia", 
+                             "Firmicutes", "Fusobacteria", 
+                             "Lentisphaerae", "Proteobacteria", 
+                             "Sprichaetes", "Synergistetes", 
+                             "Verrucomicrobia"), 
+                  #colors for each category
+                  values = c("#4bb092", "#618bcb",
+                             "#b95d6a", "#79853d",
+                             "#c783c1", "#bd7a43",
+                             "#c9aa3c", "#d4447a",
+                             "#7663cb", "#67b34a",
+                             "#d35238")  )
+posbut_plotwk3
+```
+
+#Combination Plot
+```{r}
+negbut_comb_plot <- plot_grid(negbut_plotwk1, negbut_plotwk3, posbut_plotwk1, posbut_plotwk3, align = "h", nrow = 2, ncol = 2)
+
+negbut_comb_plot
+
+```
+
+
+## Difference in Richness between positive and negative respondents
+
+```{r}
+# calculate richness
+richness_df <- physq_but %>%
+  # calculate richness
+  estimate_richness(., split = TRUE,  measures = c("Observed")) %>% 
+  # make sample_id column before join 
+  rownames_to_column(var = "id") %>% 
+  # join with sample data imported above
+  inner_join(butyrate_df, by = "id") %>%  
+  rename(richness = Observed) %>%
+  # calculate average richness per person, per week 
+  group_by(participant_id, study_week, semester.x, 
+          butyrate_status) %>%
+  summarise(avg_richness = round(mean(richness), digits = 0)) 
+
+richness_df
+dim(richness_df)
+```
+
+# Richness plot(s)
+```{r}
+rich1 <- physq_but %>%
+  plot_richness(., "study_week", measures = c("Observed")) +
+  facet_grid("butyrate_status") +
+  ylab("Richness (Observed ESVs)") + xlab(NULL)
+rich1
+
+rich1$layers <- rich1$layers[-1] #drop geom_point 
+
+rich2 <- rich1 +   
+  geom_violin(aes(color = study_week)) + #add violin in color
+  geom_jitter(aes(color = study_week)) +  #add individual points in color 
+  theme(legend.position = "none")
+rich2
+```
+```{r}
+
+
+#Sample Sizes
+richness_df%>%
+  group_by(butyrate_status) %>%
+  summarise(sample_size = n())
+```
+
+```{r}
+# statistical test(s)
+
+repos_wk1 <- richness_df %>%
+  filter(butyrate_status == "positive",
+         study_week == "week1")
+  shapiro.test(repos_wk1$avg_richness) #p-value = 0.2289
+  
+repos_wk3 <- richness_df %>%
+  filter(butyrate_status == "positive",
+         study_week == "week3")
+  shapiro.test(repos_wk3$avg_richness) #p-value = 0.6196
+  
+reneg_wk1 <- richness_df %>%
+  filter(butyrate_status == "negative",
+         study_week == "week1")
+  shapiro.test(reneg_wk1$avg_richness) #p-value = 0.8638
+  
+reneg_wk3 <- richness_df %>%
+  filter(butyrate_status == "negative",
+         study_week == "week3")
+  shapiro.test(reneg_wk3$avg_richness) #p-value = 0.512
+  
+ggplot(repos_wk1, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(repos_wk1$avg_richness); qqline(repos_wk1$avg_richness)
+
+ggplot(reneg_wk1, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(reneg_wk1$avg_richness); qqline(reneg_wk1$avg_richness)
+
+ggplot(repos_wk3, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(repos_wk3$avg_richness); qqline(repos_wk3$avg_richness)
+
+ggplot(reneg_wk1, aes(x=avg_richness)) +
+  geom_histogram() 
+qqnorm(reneg_wk3$avg_richness); qqline(reneg_wk3$avg_richness)
+
+#check variances
+  var.test(x = repos_wk1$avg_richness, 
+         y = repos_wk3$avg_richness, 
+         alternative = "two.sided") 
+  #p-value = 0.01683, variances are not equal
+   
+  var.test(x = reneg_wk1$avg_richness, 
+         y = reneg_wk3$avg_richness, 
+         alternative = "two.sided") 
+#p-value= 0.08123, variances are equal
+
+```
+
+```{r}
+#Statistical Test
+t.test(x = repos_wk1$avg_richness, 
+       y = repos_wk3$avg_richness,  
+       var.equal = FALSE,
+       paired = TRUE,
+       alternative = "two.sided")
+#p-value -  0.06531
+
+t.test(x = reneg_wk1$avg_richness, 
+       y = reneg_wk3$avg_richness,  
+       var.equal = TRUE,
+       paired = TRUE,
+       alternative = "two.sided")
+
+#p-value: 8.909e-06
+
+```
+
+Conclusion: YES there was a highly significant change in richness for the negative responses from week 1 to week 3, and a marginally significant (using 0.10 significance threshold) for the positive response individuals from week1 to week3.
+
+
+## Community Composition
+
+Conduct an ordination using the Bray-Curtis index to determine if the communities of participants were different based on whether they had a positve or negative change in butyrate. Do not include any data from when individuals consumed starch (week 3) in this analysis. 
+```{r}
+# data formatting 
+physq_but1 <- physq_but %>% 
+  subset_samples(., study_week == "week1") %>% #composition before the consumption of starch
+  prune_taxa(taxa_sums(.) > 1000, .) %>%
+  prune_samples(sample_sums(.) > 1000, .)
+
+# get read counts 
+but_sum_df <- data.frame(sum = sample_sums(physq_but1))
+
+# Histogram of sample read counts
+ggplot(but_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "gray", binwidth = 2500) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank())
+
+# Summary statistics on read counts 
+min(sample_sums(physq_but1)) #6271
+mean(sample_sums(physq_but1)) #19450.17
+max(sample_sums(physq_but1))  #34432
+
+# scale samples to even depth using custom function
+physq_scale <- physq_but1 %>%
+  scale_reads(round = "round") 
+
+#you want the stress to be less than 0.20
+```
+
+```{r}
+# reads coutns + subsample
+#see above
+```
+
+```{r}
+# ordination
+
+physq_butbc_1 <- ordinate(physq_scale, 
+           method = "NMDS", 
+           k=3, maxit=500, try=50,
+           distance = "bray")
+physq_butbc_1
+
+#you want the stress to be less than 0.20
+```
+
+```{r}
+# plot
+
+ordplot_but <- plot_ordination(physeq = physq_but1, 
+                     ordination = physq_butbc_1, 
+                     type = "samples", 
+                     color = "butyrate_status", 
+                     shape = "semester")
+print(ordplot_but)
+
+#Find outlier individuals (super positive/super negative -- look at dietary info for shared characteristics (fiber and protein))
+```
+
+```{r}
+# Bray-Curtis 
+
+# calculate BC index, get distance matrix
+dat_bray_1 <- phyloseq::distance(physq_but1, method = "bray") 
+
+samplebdf <- physq_but1%>% 
+  sample_data(.) %>% #extract sample data from phyloseq object 
+  as(., "data.frame") #convert to data frame for adonis()
+
+# run test
+adn_res <- adonis(formula = dat_bray_1 ~ butyrate_status, 
+                  data = samplebdf)
+
+# view results 
+print(adn_res)
+
+# Jaccard 
+
+# calculate index, get distance matrix
+dat_jac_1 <- phyloseq::distance(physq_but1, method = "jaccard") 
+
+samplejdf <- physq_but1%>% 
+  sample_data(.) %>% #extract sample data from phyloseq object 
+  as(., "data.frame") #convert to data frame for adonis()
+
+# run test
+adn_res2 <- adonis(formula = dat_jac_1 ~ butyrate_status, 
+                  data = samplejdf)
+
+# view results 
+print(adn_res2)
+```
+High p-value and low R2 indicate that there may be no significant initial difference in community composition between the postive and negative respondents. 
+
+
+#Look at the Two Outlier Individuals
+
+```{r}
+#Summary Statistics ffor Butyrate Delta
+
+summary(butyrate_delta$delta_but)
+
+#Make a Df with just the two individuals 
+
+outlierdf <- butyrate_delta %>%
+  filter(delta_but >= 30 | delta_but <= -20)
+
+#Very Positive: U132
+#Very Negative: U778
+```
+
+
+#Look at Antibiotic Correlations
+
+
+##Import Antibiotic Data
+```{r}
+
+antibioticdf <- read_delim("antibiotic_data.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE) %>%
+  # make all column names lower case
+  rename_all(tolower) %>%
+  distinct(participant_id, .keep_all = TRUE)
+
+butantibdf <- merge(butyrate_df, antibioticdf, by = "participant_id", all.x= TRUE) %>%
+   select(-id) %>%
+  filter(antibiotic_past_year != "unknown") %>%
+    spread(study_week, butyrate_mean)  %>%
+  # drop NAs from select columns
+  drop_na(week1, week3) %>% 
+  gather(study_week, butyrate_mean, week1, week3) %>%
+  mutate(id = paste(participant_id, study_week, sep = "_"))
+```
+
+#Proportion Table + Test for Antibiotic Status and Butyrate Status
+```{r}
+
+butantiprop_tab <- with(butantibdf, table(antibiotic_past_year, butyrate_status))
+
+butantiprop_tab
+
+prop.test(butantiprop_tab, 
+          alternative = "two.sided",
+          correct = FALSE)
+
+```
+
+#Outlier Antibiotics
+```{r}
+outlierantibdf <- merge(outlierdf, antibioticdf, by = "participant_id", all.x= TRUE)
+
+#Negative individual did not consume antibiotics, Positive individual is unknown
+
+```
+
+#Look at Dietary Commonalities
+
+```{r}
+veg_meatdf <- read_delim("veg_meat_data.txt", 
+                            delim = "\t", escape_double = FALSE, 
+                            trim_ws = TRUE) %>%
+  filter(diet_status == "Omnivorous" |
+        diet_status == "Vegetarian" |
+        diet_status == "Pescatarian" |
+        diet_status == "Vegan" |
+        diet_status == "Flexitarian" |
+        diet_status == "Non-red Omnivorous") %>%
+  # make all column names lower case
+  rename_all(tolower) %>%
+  distinct(participant_id, .keep_all = TRUE)
+
+butvegmeatdf <- merge(butyrate_df, veg_meatdf, by = "participant_id", all.x= TRUE) %>%
+   select(-id) %>%
+    spread(study_week, butyrate_mean)  %>%
+  # drop NAs from select columns
+  drop_na(week1, week3) %>% 
+  gather(study_week, butyrate_mean, week1, week3) %>%
+  mutate(id = paste(participant_id, study_week, sep = "_"))
+
+```
+
+#Proportion Test for Butyrate Status and Diet Status 
+```{r}
+
+butvegmeatprop_df<- butvegmeatdf %>%
+    filter(diet_status == "Omnivorous" |
+        diet_status == "Vegetarian" ) 
+
+butvegmeatprop_df %>%
+  group_by(diet_status, butyrate_status) %>%
+  summarise(Counts = n())
+
+butvegmeatprop_tab <- with(butvegmeatprop_df, table(diet_status, butyrate_status))
+
+butvegmeatprop_tab
+
+prop.test(butvegmeatprop_tab, 
+          alternative = "two.sided",
+          correct = FALSE)
+
+```
